@@ -1,0 +1,36 @@
+services:
+  api:
+    build: .
+    image: jacquard-merge:latest
+    container_name: jacquard-merge-api
+    ports:
+      # 宿主端口可用 API_PORT 覆盖： API_PORT=9090 docker compose up
+      - "${API_PORT:-8080}:8080"
+    environment:
+      DB_PATH: /data/jacquard.db
+    volumes:
+      - jacquard-data:/data
+    restart: unless-stopped
+
+  # 一次性验收服务：启动完整服务栈后运行全部单元/接口/端到端验收，退出码即验收结论
+  verify:
+    image: jacquard-merge:latest
+    build: .
+    container_name: jacquard-merge-verify
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://api:8080
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        python -m pytest -q tests
+        python scripts/acceptance.py
+        echo "verify: ALL CHECKS PASSED"
+    profiles: ["verify"]
+    restart: "no"
+
+volumes:
+  jacquard-data:
