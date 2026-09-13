@@ -71,7 +71,7 @@ def insert_task(task_id: str, result: dict[str, Any], path: str | None = None) -
                 result["input_hash"],
                 1 if result["status"] == "blocked" else 0,
                 result["needle_count"],
-                json.dumps(result, ensure_ascii=False, sort_keys=True),
+                json.dumps(result, ensure_ascii=True, sort_keys=True),
                 created_at,
             ),
         )

@@ -13,9 +13,16 @@
 
 ## 裁决规则
 
-1. **隔板同序强制相配**：两路隔板按顺序逐位比较标号；首个不一致点即为
-   顺序冲突，其后所有隔板不再相配，受影响段落一律挂起。
-2. **分段单调全局对齐**（Needleman–Wunsch 变体），每个由相配隔板围成的段独立对齐：
+1. **隔板同序相配（LCS 锚点，不是逐位硬比）**：对两路隔板标号求最长公共
+   子序列对齐——同标号且保持相对顺序的隔板成为相配锚点；一路缺某张隔板
+   只产生两个缺口，**不会**被误报成“下一张隔板顺序冲突”。
+   平局裁决与纹板对齐一致：缺口（未配隔板）数最少，仍并列时配对索引序列
+   字典序最小。
+   - 某标号只出现在一路 → `separator_missing`，定位到那一路，修复目标是**补隔板**；
+   - 某标号两路都有但无法同序相配（两侧都落在缺口）→ `separator_order`，
+     各指向两路中的真实位置，修复目标是**理顺顺序**。
+2. **分段单调全局对齐**（Needleman–Wunsch 变体），每个由相配隔板锚点围成、
+   且区间内没有未配隔板的段独立对齐；含未配隔板的区间身份无界，整体挂起：
    - 配对代价 = 两掩码的**汉明距离**；
    - 插入 / 删除（单边纹板）代价 = **4**；
    - 只允许单调、不交叉的配对。
@@ -26,21 +33,18 @@
       配对索引序列为命中配对的段内下标元组
       `((i1,j1),(i2,j2),…)`，按 Python 元组字典序比较——即并列时优先
       “尽早、按下标自然顺序配对”的方案，保证结果唯一、可复刻。
-4. **母版孔位裁决**：
+4. **母版孔位与编号**：
    - 配对纹板的针位一致 → 该针位确定（`0`/`1`）；
    - 针位分歧（灰尘假孔等）→ 母版记 `?`，该针位进入复扫清单；
    - 单边纹板（漏扫/重扫）→ 保留一个全部 `?` 的挂起槽位，整张进入复扫清单，
-     **绝不**用下一张纹板顶替。
+     **绝不**用下一张纹板顶替；
+   - `slot` 是整链**全局唯一**的纹板槽位号（隔板不占号），即使隔板冲突后
+     两路纹板分别挂起也不会重号，外部系统可凭 `slot`（或 `(segment,slot)`）
+     唯一引用槽位；`seq` 为含隔板的全局条目号。
 5. **发布门控**：隔板不全、顺序冲突、或存在任何未决针位时，发布接口返回
    `409`，只有复扫补全后重新提交的任务可发布。
-
-### 段落安全边界
-
-- 头段（第一张隔板之前）以及相配隔板之间的段：两侧都有相配隔板封界，独立对齐；
-- 最后一张相配隔板**之后的尾段**：只有当两路隔板恰好全部同序相配
-  （无冲突、无缺张、无多余隔板）时才对齐；否则尾段身份无界，全部挂起待复扫。
-- 若某处隔板顺序冲突，冲突点两侧的隔板与后续段不再跨路配对，两路剩余内容
-  各自挂起，从结构上杜绝“按下标硬合”导致的整链串位。
+6. **畸形输入不中断服务**：异常扫描标签（孤立代理字符、非字符串、空白、
+   超长等）在校验层转成带位置的 `400`，不会以 500 中断任务创建。
 
 ## 数据模型
 
@@ -175,7 +179,7 @@ app/
   errors.py      # 可定位错误（路次/纹板/针位）
   storage.py     # SQLite：输入哈希、映射、代价、裁决持久化
   main.py        # FastAPI：创建 / 读取 / 发布 / 健康检查
-tests/           # 对齐裁决、合片装配、HTTP 接口测试
+tests/           # 对齐裁决、合片装配、HTTP 接口、畸形输入 fuzz 测试
 scripts/
   acceptance.py  # verify 服务使用的端到端验收脚本
 docker-compose.yml   # api（API_PORT 可覆盖宿主端口）+ 一次性 verify
@@ -189,7 +193,10 @@ Dockerfile
 | 断链漏扫、后续不串位 | `test_missing_card_does_not_shift_later_match`、`test_missing_card_keeps_later_positions_stable`、`test_missing_card_scenarios_end_to_end_no_shift` |
 | 回带重扫 | `test_duplicate_scan_is_gap_not_forced_match`、`test_duplicate_scan_marked_single_side_without_shift` |
 | 灰尘假孔 / 针位分歧 | `test_dust_disagreement_is_cheap_substitution`、`test_dust_disagreement_marks_exact_needles` |
-| 隔板缺张 / 顺序冲突 | `test_separator_missing_on_one_track`、`test_separator_order_conflict`、`test_separator_prefix_matched_head_still_aligned` |
+| 一路漏隔板不被误报成顺序冲突 | `test_missing_separator_not_misreported_as_order`、`test_missing_separator_not_misreported_via_api` |
+| 隔板顺序冲突定位到真实位置 | `test_separator_order_conflict`、`test_separator_order_conflict_points_at_real_positions` |
+| 冲突后母版槽位全局唯一 | `test_master_slots_globally_unique_under_conflict`、`test_master_slots_globally_unique_via_api` |
+| 畸形扫描标签不中断服务 | `test_malformed_separator_label_is_actionable_400`、`test_malformed_label_returns_400_not_500`、`test_fuzz.py`（120 随机结构 + 代理字符 fuzz） |
 | 最优解平局（代价 → 缺口 → 字典序） | `test_tie_break_fewest_gaps`、`test_tie_break_lexicographic_pairs_explicit`、`test_bruteforce_cross_check`（80 随机例穷举校验） |
 | 坏掩码定位 | `test_bad_requests_are_located`、`test_bad_mask_returns_400_with_needle_location` |
 | 发布门控与幂等 | `test_publish_ready_task_returns_master`、`test_publish_blocked_task_is_409_with_locations` |

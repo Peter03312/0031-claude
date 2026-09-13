@@ -143,19 +143,64 @@ def main() -> int:
     check("separator missing: publish 409",
           client.post(f"/tasks/{t['id']}/publish").status_code == 409)
 
-    # 6. 隔板顺序冲突
+    # 6. 隔板顺序冲突（S1/S2 两路都在但颠倒）
     code, resp = create(
         client,
         body(
-            [sep("S1"), card("11110000"), sep("S2")],
-            [sep("S2"), card("11110000"), sep("S1")],
+            [sep("S1"), card("11110000"), sep("S2"), card("00001111")],
+            [sep("S2"), card("11110000"), sep("S1"), card("00001111")],
         ),
     )
     t = resp["task"]
-    reasons = {d["reason"] for d in t["separator_review"]["defects"]}
-    check("separator order: conflict detected", "separator_order" in reasons)
-    check("separator order: no aligned segments",
-          t["verdict"]["summary"]["aligned_segments"] == 0)
+    order = [d for d in t["separator_review"]["defects"]
+             if d["reason"] == "separator_order"]
+    # 平局裁决选 S1 作锚点；S2 两侧未配 → 两条 order，定位 t1:3 ↔ t2:1
+    check("separator order: unpaired label reported twice", len(order) == 2)
+    positions = sorted((o["label"], o["track"], o["item"],
+                        o["other_track"], o["other_item"]) for o in order)
+    check("separator order: located at real positions",
+          positions == [("S2", 1, 3, 2, 1), ("S2", 2, 1, 1, 3)],
+          json.dumps(positions))
+    check("separator order: anchor still matched",
+          t["separator_review"]["matched"] == ["S1"])
+    card_entries = [e for e in t["master"]["entries"] if e["kind"] == "card"]
+    slots = [e["slot"] for e in card_entries]
+    check("separator order: master slots globally unique",
+          len(slots) == len(set(slots)), json.dumps(slots))
+
+    # 6b. 一路漏掉 S1：只能报 S1 缺失，绝不能误报 S2 冲突/缺失
+    code, resp = create(
+        client,
+        body(
+            [sep("S1"), card("11110000"), sep("S2"), card("00001111")],
+            [sep("S2"), card("00001111")],
+        ),
+    )
+    t = resp["task"]
+    defects = t["separator_review"]["defects"]
+    check("missing separator: only S1 missing reported",
+          len(defects) == 1 and defects[0]["reason"] == "separator_missing"
+          and defects[0]["label"] == "S1" and defects[0]["track"] == 1,
+          json.dumps(defects))
+    check("missing separator: S2 matched, publish 409",
+          t["separator_review"]["matched"] == ["S2"]
+          and client.post(f"/tasks/{t['id']}/publish").status_code == 409)
+
+    # 6c. 畸形扫描标签：必须是可操作的 400，而不是 500。
+    # 用 JSON 转义 \\ud800 原文（httpx 可发送，服务端解码为孤立代理）
+    raw_payload = (
+        b'{"needle_count": 8, "tracks": ['
+        b'{"items": [{"type": "separator", "label": "bad\\ud800label"}]},'
+        b'{"items": [{"type": "separator", "label": "S1"}]}]}'
+    )
+    r = client.post(
+        "/tasks", content=raw_payload,
+        headers={"content-type": "application/json"},
+    )
+    check("malformed label: 400 actionable",
+          r.status_code == 400
+          and r.json()["error"]["code"].startswith("separator_label_"),
+          f"status={r.status_code}")
 
     # 7. 坏掩码 → 400，定位到路次/纹板/针位
     r = client.post("/tasks", json=body([card("10x01010")], [card("10101010")]))

@@ -189,21 +189,104 @@ def test_separator_prefix_matched_head_still_aligned() -> None:
 
 
 def test_separator_order_conflict() -> None:
+    # 两路都有 S1、S2，但顺序颠倒：应报一次 order 缺陷，指向两张同标号隔板
     req_body = body(
         [sep("S1"), card("11110000"), sep("S2"), card("00001111")],
         [sep("S2"), card("11110000"), sep("S1"), card("00001111")],
     )
     _, result = result_for_body(req_body)
     defects = result["separator_review"]["defects"]
-    reasons = sorted(d["reason"] for d in defects)
-    assert "separator_order" in reasons
-    order = next(d for d in defects if d["reason"] == "separator_order")
-    assert order["track"] == 1 and order["item"] == 1
-    assert order["other_track"] == 2 and order["other_item"] == 1
-    # 没有相配隔板 → 无对齐段，所有纹板挂起
-    assert result["separator_review"]["matched_count"] == 0
+    # 平局裁决选配对序列字典序最小的 S1 作锚点；S2 两侧都未配 → order×2
+    orders = [d for d in defects if d["reason"] == "separator_order"]
+    assert {d["label"] for d in orders} == {"S2"}
+    o = next(d for d in orders if d["track"] == 1)
+    assert (o["track"], o["item"]) == (1, 3)
+    assert (o["other_track"], o["other_item"]) == (2, 1)
+    assert result["separator_review"]["matched"] == ["S1"]
+    assert result["separator_review"]["matched_count"] == 1
     assert all(s["aligned"] is False for s in result["segments"])
     assert not result["verdict"]["publishable"]
+
+
+def test_missing_separator_not_misreported_as_order() -> None:
+    # 第 1 路 [S1,S2]、第 2 路 [S2]：S1 仅是第 1 路缺张，
+    # 绝不能误报成 S2 顺序冲突，也不能再说 S2 缺失
+    req_body = body(
+        [sep("S1"), card("11110000"), sep("S2"), card("00001111")],
+        [sep("S2"), card("00001111")],
+    )
+    _, result = result_for_body(req_body)
+    defects = result["separator_review"]["defects"]
+    assert len(defects) == 1
+    d = defects[0]
+    assert d["reason"] == "separator_missing"
+    assert d["label"] == "S1" and d["track"] == 1 and d["item"] == 1
+    assert result["separator_review"]["matched"] == ["S2"]
+
+
+def test_master_slots_globally_unique_under_conflict() -> None:
+    # 隔板冲突后两路纹板分别挂起：segment 与 slot 都不得重号
+    req_body = body(
+        [sep("S1"), card("11110000"), sep("S2"), card("00001111")],
+        [sep("S2"), card("11110000"), sep("S1"), card("00001111")],
+    )
+    _, result = result_for_body(req_body)
+    cards = master_cards(result)
+    # slot 全局唯一
+    slots = [c["slot"] for c in cards]
+    assert len(slots) == len(set(slots))
+    # seq 全局唯一且连续
+    seqs = [c["seq"] for c in cards]
+    assert len(seqs) == len(set(seqs))
+    # 同一联合区间内两路纹板共享 region 号，但槽位号不同
+    region_slots: dict[int, set[int]] = {}
+    for c in cards:
+        region_slots.setdefault(c["segment"], set()).add(c["slot"])
+    for region, rs in region_slots.items():
+        assert len(rs) == sum(1 for c in cards if c["segment"] == region)
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["\ud800", "", "   ", 5, None, ["S1"], {"x": 1}, True, 3.2, "x" * 65],
+)
+def test_malformed_separator_label_is_actionable_400(label) -> None:
+    with pytest.raises(RequestError) as ei:
+        result_for_body(
+            body(
+                [{"type": "separator", "label": label}],
+                [{"type": "separator", "label": "S1"}],
+            )
+        )
+    err = ei.value
+    assert err.code.startswith("separator_label_")
+    assert err.track == 1 and err.item == 1
+
+
+def test_name_field_validation() -> None:
+    # 合法 Unicode（含中文、emoji）接受
+    for ok in ("链", "🔥", "chain-1907-c"):
+        _, result = result_for_body(
+            body([card("11110000")], [card("11110000")], name=ok)
+        )
+        assert result["name"] == ok
+
+    # 非字符串 / 空白 / 不可编码 → 400（构造原始 body 传入）
+    for bad in (9, "", "   ", "\ud800"):
+        with pytest.raises(RequestError):
+            result_for_body(
+                {"needle_count": NC, "name": bad, "tracks": [
+                    {"items": [card("11110000")]},
+                    {"items": [card("11110000")]}]}
+            )
+
+    # 缺省 name 字段仍然允许
+    _, result = result_for_body(
+        {"needle_count": NC, "tracks": [
+            {"items": [card("11110000")]},
+            {"items": [card("11110000")]}]}
+    )
+    assert result["name"] is None
 
 
 # ---------------------------------------------------------------- 坏掩码 / 结构错误
